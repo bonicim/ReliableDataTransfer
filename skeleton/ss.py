@@ -1,4 +1,10 @@
 import udt
+import config
+import socket
+import select
+import threading
+import _thread
+import struct
 
 
 class StopAndWait:
@@ -8,6 +14,24 @@ class StopAndWait:
 	def __init__(self, local_port, remote_port, msg_handler):
 		self.network_layer = udt.NetworkLayer(local_port, remote_port, self)
 		self.msg_handler = msg_handler
+		self.seq_num = 0
+		self.lock = threading.RLock()  # to ensure thread-safe global var of seq_num
+		self.header_format = "!hhh"
+		# self.init_sck(local_port)
+
+	def init_sck(self, local_port):
+		# TODO: Verify if this is needed
+		srv_sck = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		srv_sck.bind(('localhost', local_port))
+		srv_sck.listen(10)
+		while True:
+			read_sockets, write_sockets, err_sockets = select.select([srv_sck], [], [])
+			for sock in read_sockets:
+				if sock == srv_sck:
+					client_socket, addr = sock.accept()
+					read_sockets.append(client_socket)
+				else:
+					_thread.start_new_thread(self.handle_arrival_msg(), (sock,))
 
 	def send(self, msg):
 		"""
@@ -16,42 +40,50 @@ class StopAndWait:
 		:param msg: msg is a byte object
 		:return:
 		"""
-		# TODO: impl protocol to send packet from application layer.
-		# call self.network_layer.send() to send to network layer.
-		# self.network_layer.send(msg)
-		pass
+		with self.lock:
+			# Step 1: Prepare the Stop and Wait Header packet
+			data_type = config.MSG_TYPE_DATA
+			checksum = 0
+			header = struct.pack(self.header_format, data_type, self.seq_num, checksum)
+			checksum = self.make_checksum(header + msg)
+			snd_pkt = self.make_sndpkt(data_type, self.seq_num, checksum, msg)
 
-	def make_checksum(self, data_type, seq_num):
+			# Step 2: Send the header packet over the network
+			self.network_layer.send(snd_pkt)
+
+			# Step 3: After sending, then call receive to get ack messages
+			self.handle_arrival_msg_sender(snd_pkt)
+
+	def make_checksum(self, data):
 		"""
 		Creates a checksum based on data_type and seq_num
-		:param data_type: a two byte object having a integer value of 1 or 2
-		:param seq_num: a two byte object having an integer value of 0 or 1
+		:param data: a byte object containing information
 		:return: Returns the ones complement of the sum of the two args
 		"""
-		# TODO: Implement
-		pass
+		checksum = 0
+		checksum += sum(data)
+		return ~checksum
 
 	def make_sndpkt(self, data_type, seq_num, checksum, payload):
 		"""
 		Creates a send packet based on arguments
-		:param data_type:
-		:param seq_num:
-		:param checksum:
-		:param payload:
-		:return: byte object consisting of arguments
+		:param data_type: integer in range 1 or 2
+		:param seq_num: integer in range 0 or 1
+		:param checksum: integer
+		:param payload: a byte object representation of the message
+		:return: byte object concatenation of args and payload
 		"""
-		# TODO: implement
-		pass
+		header = struct.pack(self.header_format, data_type, seq_num, checksum)
+		return header + payload
 
-	def isACK(self, rcvpkt, seq_num):
+	def isACK(self, rcvpkt):
 		"""
 		Returns True if the packet is an ACK message; false otherwise
 		:param rcvpkt: a byte object represented in transport layer segment format
-		:param seq_num: a byte object representing the expected sequence number of 0 or 1
 		:return: Boolean
 		"""
-		# TODO: implement
-		pass
+		with self.lock:
+			return struct.unpack("!hhh", rcvpkt)[1] == self.seq_num
 
 	def corrupt(self, rcvpkt):
 		"""
@@ -59,27 +91,36 @@ class StopAndWait:
 		:param rcvpkt: a byte object represented in transport layer segment format
 		:return: Boolean
 		"""
-		# TODO: implement
-		pass
+		return (sum(rcvpkt) & 1) == sum(rcvpkt)
 
-	def notcorrupt(self, rcvpkt):
-		"""
-		Returns true if rcvpkt is corrupt false other wise
-		:param rcvpkt: a byte object represented in transport layer segment format
-		:return: Boolean
-		"""
-		# TODO: implement
-		pass
-
-	def handle_arrival_msg(self):
+	def handle_arrival_msg_sender(self, snd_pkt):
 		"""
 		Receives msg from the network layer
-		:return:
+		Only meant for receiver
+		Must make one for sender
+		:return: Boolean
 		"""
+		packet = self.network_layer.recv()
+		if self.corrupt(packet) or not self.isACK(packet):
+			self.network_layer.send(snd_pkt)
+			self.handle_arrival_msg_sender(snd_pkt)
+		else:
+			with self.lock:
+				if self.seq_num == 0:
+					self.seq_num == 1
+				else:
+					self.seq_num == 0
+			return True
+
+	def handle_arrival_msg(self):
 		msg = self.network_layer.recv()
-		# TODO: impl protocol to handle arrived packet from network layer.
-		# call self.msg_handler() to deliver to application layer.
-		pass
+		
+		# check for corruption
+		# check for expected seq_num
+		# build the sndpkt
+		# send to the sender
+		# pass msg to the app layer
+		self.msg_handler(msg)
 
 	def has_seq_0(self, rcvpkt):
 		"""
